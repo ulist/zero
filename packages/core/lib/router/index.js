@@ -18,128 +18,44 @@ const fetch = require("node-fetch")
 const debug = require('debug')('core')
 const ora = require('ora');
 const del = require('del');
+const session = require('zero-express-session')
+const routeVM = require('./routeVM')
 
-var lambdaIdToPortMap = {}
 var getLambdaID = function(entryFile){
   return require("crypto").createHash('sha1').update(entryFile).digest('hex')
 }
 
-async function proxyLambdaRequest(req, res, endpointData){
-  const spinner = ora({
-    color: 'green',
-    spinner: "star"
-  })
+async function handleRequest(req, res, endpointData){
+  // const spinner = ora({
+  //   color: 'green',
+  //   spinner: "star"
+  // })
   var lambdaID = getLambdaID(endpointData[1])
-  if (!lambdaIdToPortMap[lambdaID]){
-    spinner.start("Building " + url.resolve("/", endpointData[0]))
-  }
+  //console.log("lambdaID", endpointData, lambdaID)
+  // if (!lambdaIdToPortMap[lambdaID]){
+  //   spinner.start("Building " + url.resolve("/", endpointData[0]))
+  // }
   if (!process.env.SERVERADDRESS){
     process.env.SERVERADDRESS = "http://"+req.headers.host
   }
-  var serverAddress = process.env.SERVERADDRESS
 
-  const port = await getLambdaServerPort(endpointData)
-  debug("req", endpointData[1], port, req.method, req.body)
-  
-  //debug("server address", serverAddress)
-  var lambdaAddress = "http://127.0.0.1:"+port
-  var options = {
-    method: req.method,
-    headers: Object.assign({ 'x-forwarded-host': req.headers.host }, req.headers),
-    compress: false,
-    redirect: 'manual',
-    //credentials: "include"
-  }
-  if (req.method.toLowerCase()!=="get" && req.method.toLowerCase()!=="head"){
-    options.body = req
-  }
-  const proxyRes = await fetch(lambdaAddress + req.url, options)
-
-  if (spinner.isSpinning){
-    spinner.succeed(url.resolve("/", endpointData[0]) + " ready")
-  }
-
-  // Forward status code
-  res.statusCode = proxyRes.status
-
-  // Forward headers
-  const headers = proxyRes.headers.raw()
-  for (const key of Object.keys(headers)) {
-    if (key.toLowerCase()==="location" && headers[key]){
-      headers[key] = headers[key][0].replace(lambdaAddress, serverAddress)
-    }
-    res.setHeader(key, headers[key])
-  }
-  res.setHeader("x-powered-by", "ZeroServer")
-
-  // Stream the proxy response
-  proxyRes.body.pipe(res)
-  proxyRes.body.on('error', (err) => {
-    console.error(`Error on proxying url: ${newUrl}`)
-    console.error(err.stack)
-    res.end()
-  })
-
-  req.on('abort', () => {
-    proxyRes.body.destroy()
-  })
+  const handler = getLambdaServerHandler(endpointData)
+  routeVM(handler, req, res, endpointData[0], endpointData[1], endpointData[2], process.env.SERVERADDRESS, "zero-builds/" + lambdaID)
+  //handler(req, res, endpointData[0], endpointData[1], endpointData[2], process.env.SERVERADDRESS, "zero-builds/" + lambdaID)
 }
 
-// if server exits, kill the child processes too.
-process.on('exit', () => {
-  for (var id in lambdaIdToPortMap){
-    lambdaIdToPortMap[id].process.kill()
-  }
-})
-
-
-function getLambdaServerPort(endpointData){
-  return new Promise((resolve, reject)=>{
-    const entryFilePath = endpointData[1]
-    const lambdaID = getLambdaID(entryFilePath)
-    if (lambdaIdToPortMap[lambdaID]) return resolve(lambdaIdToPortMap[lambdaID].port)
-    const fork = require('child_process').fork;
-    const program =  handlers[endpointData[2]].process
-    const parameters = [endpointData[0], endpointData[1], endpointData[2], process.env.SERVERADDRESS, "zero-builds/" + lambdaID];
-    const options = {
-      stdio: [ 'pipe', 'pipe', 'pipe', 'ipc' ]
-    };
-
-    const child = fork(program, parameters, options);
-
-    child.stdout.on('data', (data) => {
-      console.log(`${data}`)
-    });
-    
-    child.stderr.on('data', (data) => {
-      console.error(`${data}`)
-    });
-    
-    // child server sends port via IPC
-    child.on('message', message => {
-      debug("got Port for", entryFilePath, message)
-      lambdaIdToPortMap[lambdaID] = {port: parseInt(message), process: child, endpointData: endpointData}
-      resolve(lambdaIdToPortMap[lambdaID].port)
-      //if (spinner) spinner.succeed(endpointData[0] + " ready")
-    })
-
-    child.on('error', (err) => {
-      debug('Failed to start subprocess.', err);
-      del(path.join(process.env.BUILDPATH, "zero-builds", lambdaID, "/**"), {force: true})
-      delete lambdaIdToPortMap[lambdaID]
-    });
-    child.on('close', (e) => {
-      debug('subprocess stopped.', e);
-      del(path.join(process.env.BUILDPATH, "zero-builds", lambdaID, "/**"), {force: true})
-      delete lambdaIdToPortMap[lambdaID]
-    });
-
-    
-  })
+function getLambdaServerHandler(endpointData){
+  return handlers[endpointData[2]].handler
 }
 
 module.exports = (buildPath)=>{
   const app = express()
+  // bootstrap express app with session
+  session(app)
+
+  app.use(require('body-parser').urlencoded({ extended: true }));
+  app.use(require('body-parser').json());
+  
   var manifest = {lambdas:[], fileToLambdas:{}}
   var forbiddenStaticFiles = []
   app.all("*", (request, response)=>{
@@ -147,7 +63,7 @@ module.exports = (buildPath)=>{
     debug("match", request.url, endpointData)
     if (endpointData){
       // call relevant handler as defined in manifest
-      return proxyLambdaRequest(request, response, endpointData)
+      return handleRequest(request, response, endpointData)
     }
     // catch all handler
     return staticHandler(request, response)
@@ -163,10 +79,10 @@ module.exports = (buildPath)=>{
     forbiddenStaticFiles = newForbiddenFiles
 
     // kill and restart servers 
-    if (filesUpdated){
+    /*if (filesUpdated){
       filesUpdated.forEach(async file=>{
         var lambdaID = getLambdaID(file)
-        if (lambdaIdToPortMap[lambdaID] && shouldKillOnChange(lambdaIdToPortMap[lambdaID].endpointData)) {
+        if (lambdaIdToPortMap[lambdaID] && lambdaIdToPortMap[lambdaID].process && shouldKillOnChange(lambdaIdToPortMap[lambdaID].endpointData)) {
           debug("killing", file, lambdaIdToPortMap[lambdaID].port)
           lambdaIdToPortMap[lambdaID].process.kill()
           // delete their bundle if any
@@ -178,17 +94,17 @@ module.exports = (buildPath)=>{
 
           delete lambdaIdToPortMap[lambdaID]
           debug("starting", endpointData)
-          if (endpointData) getLambdaServerPort(endpointData)
+          if (endpointData) getLambdaServerHandler(endpointData)
         }
       })
     }
     else{
       // kill all servers
       for (var file in lambdaIdToPortMap){
-        //debug("killing", lambdaIdToPortMap[i].port)
-        lambdaIdToPortMap[getLambdaID(file)].process.kill()
+        if (lambdaIdToPortMap[getLambdaID(file)])
+          lambdaIdToPortMap[getLambdaID(file)].process.kill()
       }
-    }
+    }*/
   }
 }
 

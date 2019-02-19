@@ -1,4 +1,4 @@
-
+require("@babel/polyfill")
 const build = require("./builder")
 const startRouter = require("./router")
 const path = require("path");

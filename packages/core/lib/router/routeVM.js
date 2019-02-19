@@ -13,34 +13,11 @@ const GLOBALS = require("./globals")
 const session = require('zero-express-session')
 
 const vm = require('vm')
-var BASEPATH, ENTRYFILE, LAMBDATYPE, SERVERADDRESS, BUNDLEPATH, HANDLER
 
+// to avoid MaxListenersExceededWarning
+process.setMaxListeners(99999)
 
-module.exports = (handler, basePath, entryFile, lambdaType, serverAddress, BundlePath, embedded) =>{
-  if (!basePath && basePath!=="") throw new Error("No basePath provided.")
-  if (!entryFile) throw new Error("No entry file provided.")
-  if (!lambdaType) throw new Error("No lambda type provided.")
-  if (!serverAddress) throw new Error("Server address not provided.")
-  if (!BundlePath) throw new Error("Lambda ID not provided.")
-  BASEPATH = basePath
-  ENTRYFILE = entryFile
-  LAMBDATYPE = lambdaType
-  SERVERADDRESS = serverAddress
-  BUNDLEPATH = BundlePath
-  debug("Server Address", SERVERADDRESS, "BundlePath", BUNDLEPATH)
-  if (embedded){
-    handler(req, res)
-  }
-  else{
-    startServer().then((port)=>{
-      if (process.send) process.send(port)
-      else console.log("PORT", port)
-    })
-  }
-  
-}
-
-function generateFetch(req){
+function generateFetch(req, serverAddress){
   return function fetch(uri, options){
     // fix relative path when running on server side.
     if (uri && uri.indexOf("://")===-1){
@@ -50,7 +27,7 @@ function generateFetch(req){
 
       // see if it's a path from root of server
       if (uri.startsWith("/")){
-        uri = url.resolve(SERVERADDRESS, uri)
+        uri = url.resolve(serverAddress, uri)
       }
       // // it's a relative path from current address
       // else{
@@ -67,11 +44,11 @@ function generateFetch(req){
       options.headers = req.headers
     }
     debug("paths",req.originalUrl, req.baseUrl, req.path)
-    debug("fetching", uri, options, SERVERADDRESS)
+    debug("fetching", uri, options, serverAddress)
     return FETCH(uri, options)
   }
 }
-
+/*
 function startServer(){
   return new Promise((resolve, reject)=>{
     
@@ -83,7 +60,7 @@ function startServer(){
     app.use(require('body-parser').urlencoded({ extended: true }));
     app.use(require('body-parser').json());
 
-    app.all("*"/*[BASEPATH, path.join(BASEPATH, "/*")]*/, handleRequest)
+    app.all("*", handleRequest)
   
     var listener = app.listen(0, "127.0.0.1", () => {
       debug("listening ", LAMBDATYPE, listener.address().port)
@@ -91,28 +68,28 @@ function startServer(){
     })
   })
 }
-
-function handleRequest(req, res){
-  const file = path.resolve(ENTRYFILE)
+*/
+function handleRequest(handlerPath, req, res, basePath, entryFile, lambdaType, serverAddress, bundlePath){
   // if path has params (like /user/:id/:comment). Split the params into an array.
   // also remove empty params (caused by path ending with slash)
   if (req.params && req.params[0]){
-    req.params = req.params[0].replace(BASEPATH.slice(1), "").split("/").filter((param)=> !!param)
+    req.params = req.params[0].replace(basePath.slice(1), "").split("/").filter((param)=> !!param)
   }
   else{
     delete req.params
   }
   try{
-    var globals = Object.assign({__Zero: {HANDLER, BASEPATH, req, res, LAMBDATYPE, BUNDLEPATH, ENTRYFILE, renderError, fetch: generateFetch(req)}}, GLOBALS);
+    var globals = Object.assign({__Zero: {handlerPath, basePath, req, res, lambdaType, bundlePath, entryFile, renderError, fetch: generateFetch(req, serverAddress)}}, GLOBALS);
 
     vm.runInNewContext(`
-      const { HANDLER, req, res, LAMBDATYPE, BASEPATH, ENTRYFILE, fetch, renderError, BUNDLEPATH } = __Zero;
+      const { handlerPath, req, res, lambdaType, basePath, entryFile, fetch, renderError, bundlePath } = __Zero;
+      const handler = require(handlerPath)
       global.fetch = fetch
-      // process.on('unhandledRejection', (reason, p) => {
-      //   renderError(reason, req, res)
-      // })
+      process.on('unhandledRejection', (reason, p) => {
+        renderError(reason, req, res)
+      })
 
-      HANDLER(req, res, ENTRYFILE, BUNDLEPATH, BASEPATH)
+      handler(req, res, entryFile, bundlePath, basePath)
     `, globals)
   }
   catch(error){
@@ -138,3 +115,5 @@ async function renderError(error, req, res){
   res.write(html)
   res.end()
 }
+
+module.exports = handleRequest
